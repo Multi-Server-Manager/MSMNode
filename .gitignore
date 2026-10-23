@@ -1,0 +1,6 @@
+# Build output
+/msm-node
+/dist/
+
+# Local state used when running from a checkout
+/.state/
