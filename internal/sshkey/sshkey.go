@@ -10,9 +10,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -69,63 +66,22 @@ func validComment(comment string) bool {
 // The directory is created 0700 and the file 0600. Pairing twice adds the key
 // once: the second call reports added=false and leaves the file untouched.
 func Authorize(line string) (path string, added bool, err error) {
-	if !Valid(line) {
-		return "", false, ErrInvalid
-	}
+	return AuthorizeFor("", line)
+}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", false, fmt.Errorf("cannot locate the home directory: %w", err)
+// containsKey reports whether an authorized_keys body already trusts line's
+// key, whatever its comment or position in the file.
+func containsKey(body, line string) bool {
+	want := keyBlob(line)
+	if want == "" {
+		return false
 	}
-	dir := filepath.Join(home, ".ssh")
-	path = filepath.Join(dir, "authorized_keys")
-
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return path, false, fmt.Errorf("cannot create %s: %w", dir, err)
-	}
-
-	existing, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return path, false, fmt.Errorf("cannot read %s: %w", path, err)
-	}
-
-	blob := keyBlob(line)
-	for _, candidate := range strings.Split(string(existing), "\n") {
-		if keyBlob(candidate) == blob {
-			// The key is already trusted; still make sure the mode is ours.
-			_ = os.Chmod(path, 0o600)
-			return path, false, nil
+	for _, candidate := range strings.Split(body, "\n") {
+		if keyBlob(candidate) == want {
+			return true
 		}
 	}
-
-	var content bytes.Buffer
-	content.Write(bytes.TrimRight(existing, "\n"))
-	if content.Len() > 0 {
-		content.WriteByte('\n')
-	}
-	content.WriteString(line)
-	content.WriteByte('\n')
-
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return path, false, fmt.Errorf("cannot write %s: %w", path, err)
-	}
-	if _, err := file.Write(content.Bytes()); err != nil {
-		file.Close()
-		return path, false, fmt.Errorf("cannot write %s: %w", path, err)
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		return path, false, fmt.Errorf("cannot flush %s: %w", path, err)
-	}
-	if err := file.Close(); err != nil {
-		return path, false, fmt.Errorf("cannot close %s: %w", path, err)
-	}
-	// Enforce the mode even when the file already existed with another one.
-	if err := os.Chmod(path, 0o600); err != nil {
-		return path, false, fmt.Errorf("cannot chmod %s: %w", path, err)
-	}
-	return path, true, nil
+	return false
 }
 
 // keyBlob returns the base64 key field of a line, or "" when it has none.

@@ -139,6 +139,8 @@ func Decode(payload []byte) (Message, error) {
 		msg = &LogsTail{}
 	case TypeSSHAuthorize:
 		msg = &SSHAuthorize{}
+	case TypeNodeSetup:
+		msg = &NodeSetup{}
 	case TypeResult:
 		msg = &Result{}
 	default:

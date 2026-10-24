@@ -22,7 +22,7 @@ func Test_instance_lock_refuses_a_second_node(t *testing.T) {
 	if !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("second lock error = %q", err)
 	}
-	if !strings.Contains(err.Error(), "kill ") {
+	if !strings.Contains(err.Error(), "--restart") {
 		t.Fatalf("second lock error names no way to stop it: %q", err)
 	}
 

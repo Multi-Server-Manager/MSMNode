@@ -11,6 +11,7 @@ const (
 	TypeMetricsSample = "metrics.sample"
 	TypeLogsTail      = "logs.tail"
 	TypeSSHAuthorize  = "ssh.authorize"
+	TypeNodeSetup     = "node.setup"
 	TypeResult        = "result"
 )
 
@@ -44,6 +45,7 @@ var (
 	packageNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._:+-]{0,63}$`)
 	unitPattern        = regexp.MustCompile(`^[a-zA-Z0-9@_][a-zA-Z0-9@._:-]{0,63}$`)
 	requestIDPattern   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	accountPattern     = regexp.MustCompile(`^[a-z_][a-z0-9_.-]{0,31}$`)
 )
 
 // PkgUpdate asks the node to upgrade every installed package.
@@ -116,6 +118,9 @@ type SSHAuthorize struct {
 	V   int    `json:"v"`
 	ID  string `json:"id"`
 	Key string `json:"key"`
+	// User names the account the line is installed for; empty means the node's
+	// configured SSH account.
+	User string `json:"user,omitempty"`
 }
 
 // Type implements Message.
@@ -181,6 +186,36 @@ type MetricsResult struct {
 type SSHAuthorizeResult struct {
 	Path  string `json:"path"`
 	Added bool   `json:"added"`
+	User  string `json:"user,omitempty"`
+}
+
+// Setup is the wire form of the node's setup answers (§8.13).
+type Setup struct {
+	RunAs   string `json:"run_as"`
+	SSHUser string `json:"ssh_user"`
+	SSHPort int    `json:"ssh_port"`
+}
+
+// NodeSetup changes the node's setup answers from a pinned console (§8.13).
+type NodeSetup struct {
+	T       string `json:"t"`
+	V       int    `json:"v"`
+	ID      string `json:"id"`
+	RunAs   string `json:"run_as"`
+	SSHUser string `json:"ssh_user"`
+	SSHPort int    `json:"ssh_port"`
+}
+
+// Type implements Message.
+func (m *NodeSetup) Type() string { return TypeNodeSetup }
+
+// SetupResult is the payload of node.setup: what the node now uses.
+type SetupResult struct {
+	RunAs   string `json:"run_as"`
+	SSHUser string `json:"ssh_user"`
+	SSHPort int    `json:"ssh_port"`
+	// Warn is present when the node cannot escalate to RunAs yet.
+	Warn string `json:"warn,omitempty"`
 }
 
 // LogsResult is the payload of logs.tail (§8.10).
@@ -203,3 +238,11 @@ func ValidUnit(unit string) bool {
 func ValidRequestID(id string) bool {
 	return len(id) <= MaxRequestIDLen && requestIDPattern.MatchString(id)
 }
+
+// ValidAccount reports whether an account name may be looked up.
+func ValidAccount(name string) bool {
+	return len(name) <= 32 && accountPattern.MatchString(name)
+}
+
+// ValidPort reports whether a value is a TCP port.
+func ValidPort(port int) bool { return port >= 1 && port <= 65535 }

@@ -40,12 +40,16 @@ type PairChallenge struct {
 func (m *PairChallenge) Type() string { return TypePairChallenge }
 
 // PairProof carries the client's transcript proof (PROTOCOL.md §6.3).
+//
+// Setup is optional and answered only by a console that asked the first-run
+// questions; without it the node keeps the answers it already has.
 type PairProof struct {
 	T          string `json:"t"`
 	V          int    `json:"v"`
 	MAC        string `json:"mac"`
 	ClientID   string `json:"client_id"`
 	ClientSPKI string `json:"client_spki"`
+	Setup      *Setup `json:"setup,omitempty"`
 }
 
 // Type implements Message.
@@ -59,6 +63,14 @@ type PairOK struct {
 	NodeID   string `json:"node_id"`
 	NodeSPKI string `json:"node_spki"`
 	OpPort   int    `json:"op_port"`
+	// SSHKey is the node's own public key, so the console can trust it for
+	// the return direction.
+	SSHKey string `json:"ssh_key,omitempty"`
+	// Setup is the effective answer set after the console's request.
+	Setup *Setup `json:"setup,omitempty"`
+	// Warn explains why the answers cannot work yet, when they cannot: a node
+	// that may not escalate to the chosen account still pairs.
+	Warn string `json:"warn,omitempty"`
 }
 
 // Type implements Message.
@@ -82,6 +94,8 @@ type InfoOK struct {
 	OS            string `json:"os"`
 	Version       string `json:"version"`
 	PinnedClients int    `json:"pinned_clients"`
+	SSHKey        string `json:"ssh_key,omitempty"`
+	Setup         *Setup `json:"setup,omitempty"`
 }
 
 // Type implements Message.

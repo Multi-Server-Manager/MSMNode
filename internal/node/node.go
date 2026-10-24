@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -21,7 +22,9 @@ import (
 	"github.com/MSM/MSMNode/internal/identity"
 	"github.com/MSM/MSMNode/internal/mdns"
 	"github.com/MSM/MSMNode/internal/proto"
+	"github.com/MSM/MSMNode/internal/sshkey"
 	"github.com/MSM/MSMNode/internal/state"
+	"github.com/MSM/MSMNode/internal/sys"
 )
 
 const (
@@ -36,6 +39,11 @@ type Options struct {
 	StateDir   string
 	OpListen   string
 	PairListen string
+	// Setup answers the first-run questions without a terminal. Anything set
+	// here is stored and never asked again.
+	Setup SetupFlags
+	// In is where the questions are read from; nil means os.Stdin.
+	In io.Reader
 	// AdvertiseHosts are the hosts printed in the pairing announcement, best
 	// first. Empty means every local address, Tailscale before LAN.
 	AdvertiseHosts  []string
@@ -50,11 +58,15 @@ type Options struct {
 	// terminal that started it gets its prompt back. `--debug` runs never
 	// detach.
 	Detach bool
+	// Restart stops the node already serving this state directory first, so
+	// `msm-node --restart` replaces an instance instead of colliding with it.
+	Restart bool
 }
 
 // Node is a running agent.
 type Node struct {
 	opts Options
+	ctx  context.Context
 	out  io.Writer
 	// debug is opts.Debug, copied out so a nil writer means "no trace".
 	debug io.Writer
@@ -66,6 +78,12 @@ type Node struct {
 	cfg    *state.Config
 	id     *identity.Identity
 	opPort int
+	// setup is cfg.Setup, copied out so a command does not take the lock.
+	setup state.Setup
+	// runner starts package and service commands as the configured account.
+	runner *sys.Runner
+	// sshKey is the node's own SSH identity; only its public line is shared.
+	sshKey *sshkey.Identity
 
 	// cmdMu serialises operational commands: one at a time, `busy` otherwise.
 	cmdMu sync.Mutex
@@ -79,7 +97,7 @@ func Run(ctx context.Context, opts Options) error {
 		opts.Out = io.Discard
 	}
 	ring := newLogRing(proto.MaxLogBufferLines)
-	n := &Node{opts: opts, out: newLogWriter(opts.Out, ring), logs: ring, debug: opts.Debug}
+	n := &Node{opts: opts, ctx: ctx, out: newLogWriter(opts.Out, ring), logs: ring, debug: opts.Debug}
 
 	cfg, id, err := state.LoadOrCreate(opts.StateDir)
 	if err != nil {
@@ -91,6 +109,16 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	n.opts = opts
 
+	if opts.Restart {
+		stopped, err := stopExisting(opts.StateDir, restartGrace)
+		if err != nil {
+			return err
+		}
+		if stopped {
+			n.logf("RESTART stopped=1")
+		}
+	}
+
 	lock, err := acquireInstanceLock(opts.StateDir)
 	if err != nil {
 		return err
@@ -98,9 +126,29 @@ func Run(ctx context.Context, opts Options) error {
 	n.lock = lock
 	defer n.releaseLock()
 
+	sshKey, err := sshkey.LoadOrCreateIdentity(filepath.Join(opts.StateDir, "ssh"))
+	if err != nil {
+		return err
+	}
+	n.sshKey = sshKey
+
+	n.setup = cfg.Setup
+	n.runner, err = sys.RunnerFor(cfg.Setup.RunAs)
+	if err != nil {
+		return err
+	}
+
 	fmt.Fprintf(n.out, "MSM-NODE id=%s version=%s state=%s\n", id.EncodedID(), opts.Version, opts.StateDir)
 	n.debugf("start version=%s state=%s paired=%d advertise=%s",
 		opts.Version, opts.StateDir, len(cfg.Clients), strings.Join(opts.AdvertiseHosts, ","))
+
+	in := opts.In
+	if in == nil {
+		in = os.Stdin
+	}
+	if err := n.configureSetup(in, n.out, opts.Setup, isTerminal(in)); err != nil {
+		return err
+	}
 
 	operational, err := tls.Listen("tcp", opts.OpListen, n.serverTLS())
 	if err != nil {
@@ -391,6 +439,51 @@ func (n *Node) handlePair(conn net.Conn, pair *pairer, signal func()) {
 		return
 	}
 
+	// The console answers the setup questions; apply them before the pairing is
+	// acknowledged, so a console that is told the setup never sees a node that
+	// still uses the old answers. A bad answer refuses without burning the
+	// code, so the operator can correct it and try again.
+	setupWarning := ""
+	if proof.Setup != nil {
+		// An empty field means "keep what this node already answered", which
+		// is how a console that typed nothing defers to the node's own
+		// account rather than forcing root.
+		current := n.currentSetup()
+		requested := state.Setup{
+			Configured: true,
+			RunAs:      proof.Setup.RunAs,
+			SSHUser:    proof.Setup.SSHUser,
+			SSHPort:    proof.Setup.SSHPort,
+		}
+		if requested.RunAs == "" {
+			requested.RunAs = current.RunAs
+		}
+		if requested.SSHUser == "" {
+			requested.SSHUser = current.SSHUser
+		}
+		if requested.SSHPort == 0 {
+			requested.SSHPort = current.SSHPort
+		}
+		switch {
+		case !proto.ValidAccount(requested.RunAs):
+			replyError(conn, proto.Errorf(proto.CodeBadArgument, "run_as is not an account name"))
+			return
+		case !proto.ValidAccount(requested.SSHUser):
+			replyError(conn, proto.Errorf(proto.CodeBadArgument, "ssh_user is not an account name"))
+			return
+		case !proto.ValidPort(requested.SSHPort):
+			replyError(conn, proto.Errorf(proto.CodeBadArgument, "ssh_port is not a port"))
+			return
+		}
+		warning, err := n.applySetup(requested, n.out)
+		if err != nil {
+			n.logf("SETUP failed=%s", err)
+			replyError(conn, proto.Errorf(proto.CodeFailed, "cannot apply the setup answers: %v", err))
+			return
+		}
+		setupWarning = warning
+	}
+
 	if !pair.succeed(code) {
 		replyError(conn, proto.Errorf(proto.CodeExpired, "the pairing code is no longer valid"))
 		return
@@ -403,14 +496,21 @@ func (n *Node) handlePair(conn net.Conn, pair *pairer, signal func()) {
 		return
 	}
 
-	if err := proto.WriteMessage(conn, &proto.PairOK{
+	setup := n.currentSetup()
+	acknowledgement := &proto.PairOK{
 		T:        proto.TypePairOK,
 		V:        proto.Version,
 		MAC:      proto.EncodeB64(proto.NodeProof(nodeKey, transcript)),
 		NodeID:   n.id.EncodedID(),
 		NodeSPKI: n.id.EncodedSPKI(),
 		OpPort:   n.opPort,
-	}); err != nil {
+		Setup:    &proto.Setup{RunAs: setup.RunAs, SSHUser: setup.SSHUser, SSHPort: setup.SSHPort},
+		Warn:     setupWarning,
+	}
+	if n.sshKey != nil {
+		acknowledgement.SSHKey = n.sshKey.PublicLine
+	}
+	if err := proto.WriteMessage(conn, acknowledgement); err != nil {
 		return
 	}
 
@@ -535,9 +635,10 @@ func (n *Node) handleInfo(conn net.Conn) {
 	hostname, _ := os.Hostname()
 	n.mu.RLock()
 	pinned := len(n.cfg.Clients)
+	setup := n.setup
 	n.mu.RUnlock()
 
-	_ = proto.WriteMessage(conn, &proto.InfoOK{
+	answer := &proto.InfoOK{
 		T:             proto.TypeInfoOK,
 		V:             proto.Version,
 		NodeID:        n.id.EncodedID(),
@@ -545,7 +646,12 @@ func (n *Node) handleInfo(conn net.Conn) {
 		OS:            runtime.GOOS + "/" + runtime.GOARCH,
 		Version:       n.opts.Version,
 		PinnedClients: pinned,
-	})
+		Setup:         &proto.Setup{RunAs: setup.RunAs, SSHUser: setup.SSHUser, SSHPort: setup.SSHPort},
+	}
+	if n.sshKey != nil {
+		answer.SSHKey = n.sshKey.PublicLine
+	}
+	_ = proto.WriteMessage(conn, answer)
 }
 
 // replyError sends an `error` message and gives the peer a moment to read it.

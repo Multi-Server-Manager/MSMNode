@@ -31,6 +31,12 @@ func main() {
 	debug := flag.Bool("debug", false, "trace TLS handshakes, pairing steps and commands to stderr; stays in the foreground")
 	detach := flag.Bool("detach", false, "return the shell prompt and keep serving in the background (default on a terminal)")
 	foreground := flag.Bool("foreground", false, "never detach; the systemd units pass this")
+	runAs := flag.String("run-as", "", "account package and service commands run as; skips the first-run question")
+	sshUser := flag.String("ssh-user", "", "account console SSH keys are installed for; skips the first-run question")
+	sshPort := flag.Int("ssh-port", 0, "port the console dials for SSH; skips the first-run question")
+	noSetup := flag.Bool("no-setup", false, "never ask the first-run questions; keep the stored answers or the defaults")
+	restart := flag.Bool("restart", false, "stop the node already serving this state directory, then start this one")
+	check := flag.Bool("check", false, "validate the stored configuration and exit; an upgrade runs this against the new binary first")
 	flag.Parse()
 
 	if *showVersion {
@@ -42,6 +48,22 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "msm-node: %v\n", err)
 		os.Exit(2)
+	}
+
+	setup := node.SetupFlags{
+		RunAs:   *runAs,
+		SSHUser: *sshUser,
+		SSHPort: *sshPort,
+		Skip:    *noSetup,
+	}
+
+	if *check {
+		if err := node.Check(node.Options{StateDir: dir, Setup: setup}); err != nil {
+			fmt.Fprintf(os.Stderr, "msm-node: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("CHECK ok")
+		return
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -56,8 +78,11 @@ func main() {
 		PairingAttempts: *pairingAttempts,
 		Version:         version,
 		Out:             os.Stdout,
+		In:              os.Stdin,
 		Debug:           debugOut(*debug),
 		Detach:          detachMode(*foreground, *detach, *debug),
+		Restart:         *restart,
+		Setup:           setup,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "msm-node: %v\n", err)

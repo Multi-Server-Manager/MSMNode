@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -70,6 +71,37 @@ func foregroundArgs(args []string) []string {
 	return append(append([]string{}, args...), "--foreground")
 }
 
+// checkBinary asks the new image whether it can start, by running its own
+// `--check` with the arguments this node was started with. The check binds no
+// port and asks no question; a failure is reported as the one line the log
+// needs.
+func (n *Node) checkBinary(path string) error {
+	args := append(foregroundArgs(os.Args)[1:], "--check")
+	cmd := exec.Command(path, args...)
+	cmd.Dir = n.opts.StateDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// A binary older than the flag (a deliberate downgrade) cannot run the
+		// check at all. The operator asked for that file, so let it start; only
+		// a binary that knows --check and fails it is refused.
+		if strings.Contains(string(output), "flag provided but not defined") {
+			return nil
+		}
+
+		line := ""
+		for _, candidate := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+				line = trimmed
+			}
+		}
+		if line == "" {
+			return err
+		}
+		return fmt.Errorf("%v: %s", err, line)
+	}
+	return nil
+}
+
 // sameBinary reports whether the file on disk is still the one this process
 // was started from. A package manager swaps the file by rename, which changes
 // the inode; a build tool may rewrite it in place, which only changes the size
@@ -111,9 +143,17 @@ func (n *Node) watchExecutable(ctx context.Context) {
 				continue
 			}
 			n.logf("UPGRADE binary=%s version=%s pid=%d restarting", path, n.opts.Version, os.Getpid())
+			if err := n.checkBinary(path); err != nil {
+				// The new image would not come up (a bad upgrade, a config it
+				// cannot read). Keep serving the old one instead of handing the
+				// node to a binary that exits on start, and do not retry this
+				// same file every ten seconds.
+				n.logf("UPGRADE refused=%s staying=%s", err, n.opts.Version)
+				initial = current
+				continue
+			}
 			if err := syscall.Exec(path, os.Args, os.Environ()); err != nil {
-				// Keep serving the old image rather than exit mid-upgrade,
-				// and do not retry this same file every ten seconds.
+				// Keep serving the old image rather than exit mid-upgrade.
 				n.logf("UPGRADE restart failed=%v", err)
 				initial = current
 			}

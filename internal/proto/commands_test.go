@@ -20,6 +20,8 @@ func Test_command_roundtrip(t *testing.T) {
 		{&MetricsSample{T: TypeMetricsSample, V: Version, ID: "a1"}, `{"t":"metrics.sample","v":1,"id":"a1"}`},
 		{&LogsTail{T: TypeLogsTail, V: Version, ID: "a1", Lines: 20}, `{"t":"logs.tail","v":1,"id":"a1","lines":20}`},
 		{&SSHAuthorize{T: TypeSSHAuthorize, V: Version, ID: "a1", Key: "ssh-ed25519 AAAA msm-console"}, `{"t":"ssh.authorize","v":1,"id":"a1","key":"ssh-ed25519 AAAA msm-console"}`},
+		{&SSHAuthorize{T: TypeSSHAuthorize, V: Version, ID: "a1", Key: "ssh-ed25519 AAAA msm-console", User: "admin"}, `{"t":"ssh.authorize","v":1,"id":"a1","key":"ssh-ed25519 AAAA msm-console","user":"admin"}`},
+		{&NodeSetup{T: TypeNodeSetup, V: Version, ID: "a1", RunAs: "root", SSHUser: "admin", SSHPort: 2200}, `{"t":"node.setup","v":1,"id":"a1","run_as":"root","ssh_user":"admin","ssh_port":2200}`},
 		{&Result{T: TypeResult, V: Version, ID: "a1", OK: true}, `{"t":"result","v":1,"id":"a1","ok":true}`},
 		{NewFailure("a1", CodeBadArgument, "nope"), `{"t":"result","v":1,"id":"a1","ok":false,"code":"bad_argument","detail":"nope"}`},
 	}
@@ -55,6 +57,24 @@ func Test_command_roundtrip_fields(t *testing.T) {
 	}
 	if install.ID != "req-1" || install.Name != "aero" {
 		t.Fatalf("decoded %+v", install)
+	}
+}
+
+// Test_account_charset proves an account name cannot become a flag, a path or
+// a second argv element when it reaches sudo (PROTOCOL.md §8.13).
+func Test_account_charset(t *testing.T) {
+	accepted := []string{"root", "nebuff", "git_1", "user-1", "a.b"}
+	refused := []string{"", "Root", "-root", "a b", "a/b", "a;b", "$(id)", "--all", strings.Repeat("a", 33)}
+
+	for _, name := range accepted {
+		if !ValidAccount(name) {
+			t.Fatalf("ValidAccount(%q) = false, want true", name)
+		}
+	}
+	for _, name := range refused {
+		if ValidAccount(name) {
+			t.Fatalf("ValidAccount(%q) = true, want false", name)
+		}
 	}
 }
 

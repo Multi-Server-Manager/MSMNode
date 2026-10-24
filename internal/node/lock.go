@@ -33,8 +33,8 @@ func acquireInstanceLock(dir string) (*instanceLock, error) {
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			if pid := readPidFile(dir); pid != "" {
 				return nil, fmt.Errorf(
-					"another msm-node is already running (pid %s); follow its log with: tail -f %s; restart it with: kill %s && msm-node",
-					pid, filepath.Join(dir, "msm-node.log"), pid)
+					"another msm-node is already running (pid %s); follow its log with: tail -f %s; restart it with: msm-node --restart",
+					pid, filepath.Join(dir, "msm-node.log"))
 			}
 			return nil, fmt.Errorf("another msm-node is already running in %s", dir)
 		}

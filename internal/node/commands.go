@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/MSM/MSMNode/internal/proto"
 	"github.com/MSM/MSMNode/internal/sshkey"
+	"github.com/MSM/MSMNode/internal/state"
 	"github.com/MSM/MSMNode/internal/sys"
 )
 
@@ -61,7 +63,9 @@ func (n *Node) dispatch(conn net.Conn, message proto.Message) {
 	case *proto.LogsTail:
 		n.handleLogs(conn, id, m.Lines)
 	case *proto.SSHAuthorize:
-		n.handleSSHAuthorize(conn, id, m.Key)
+		n.handleSSHAuthorize(conn, id, m.Key, m.User)
+	case *proto.NodeSetup:
+		n.handleNodeSetup(conn, id, m)
 	default:
 		n.cmdMu.Unlock()
 		n.sendResult(conn, proto.NewFailure(id, proto.CodeUnknownType,
@@ -85,6 +89,8 @@ func requestID(message proto.Message) string {
 	case *proto.LogsTail:
 		return m.ID
 	case *proto.SSHAuthorize:
+		return m.ID
+	case *proto.NodeSetup:
 		return m.ID
 	default:
 		return ""
@@ -142,17 +148,23 @@ func (n *Node) runPackage(conn net.Conn, id, name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), packageTimeout)
 	defer cancel()
 
+	runner := n.commandRunner()
 	var output strings.Builder
+	var executed [][]string
 	exitCode := 0
 	failure := ""
 
 	for _, argv := range commands {
-		n.logf("COMMAND %s", strings.Join(argv, " "))
-		result, err := sys.Run(ctx, argv)
+		actual := runner.Argv(argv)
+		executed = append(executed, actual)
+		n.logf("COMMAND %s", strings.Join(actual, " "))
+		result, err := runner.Run(ctx, argv)
 		output.WriteString(result.Output)
 
 		if err != nil {
-			failure = fmt.Sprintf("cannot start %s: %v", argv[0], err)
+			// The runner already phrased this: no account, no passwordless
+			// sudo, or a binary the host does not have.
+			failure = err.Error()
 			exitCode = -1
 			break
 		}
@@ -162,7 +174,13 @@ func (n *Node) runPackage(conn net.Conn, id, name string) {
 			break
 		}
 		if result.ExitCode != 0 {
+			// The manager's own last line is the reason: a dnf run without
+			// root says so in plain words, and "exited with 1" alone leaves
+			// an operator guessing.
 			failure = fmt.Sprintf("%s exited with %d", argv[0], result.ExitCode)
+			if tail := sys.TailLine(result.Output); tail != "" {
+				failure += ": " + tail
+			}
 			exitCode = result.ExitCode
 			break
 		}
@@ -170,7 +188,7 @@ func (n *Node) runPackage(conn net.Conn, id, name string) {
 
 	payload := &proto.PackageResult{
 		Manager:  manager.Name,
-		Commands: commands,
+		Commands: executed,
 		ExitCode: exitCode,
 		Output:   sys.TrimOutput(output.String()),
 	}
@@ -202,20 +220,25 @@ func (n *Node) handleSvcRestart(conn net.Conn, id, unit string) {
 		n.sendResult(conn, proto.NewFailure(id, proto.CodeUnsupported, "systemd is not running on this host"))
 		return
 	}
+	if runner := n.commandRunner(); !runner.IsRoot() {
+		n.sendResult(conn, proto.NewFailure(id, proto.CodeFailed, n.notRoot(runner, "systemctl restart")))
+		return
+	}
 
 	n.extend(conn, serviceTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout)
 	defer cancel()
 
-	result, err := sys.Run(ctx, sys.RestartArgv(unit))
+	argv := sys.RestartArgv(unit)
+	result, err := n.commandRunner().Run(ctx, argv)
 	if err != nil {
-		n.sendResult(conn, proto.NewFailure(id, proto.CodeFailed, "cannot start systemctl: "+err.Error()))
+		n.sendResult(conn, proto.NewFailure(id, proto.CodeFailed, err.Error()))
 		return
 	}
 	if result.ExitCode != 0 {
 		detail := fmt.Sprintf("systemctl restart %s exited with %d", unit, result.ExitCode)
-		if trimmed := sys.TrimOutput(result.Output); trimmed != "" {
-			detail += ": " + trimmed
+		if tail := sys.TailLine(result.Output); tail != "" {
+			detail += ": " + tail
 		}
 		n.sendResult(conn, proto.NewFailure(id, proto.CodeFailed, detail))
 		return
@@ -253,8 +276,8 @@ func (n *Node) handleHostReboot(conn net.Conn, id, confirm string) {
 		n.sendResult(conn, proto.NewFailure(id, proto.CodeUnsupported, "systemd is not running on this host"))
 		return
 	}
-	if os.Geteuid() != 0 {
-		n.sendResult(conn, proto.NewFailure(id, proto.CodeFailed, "systemctl reboot needs root; run msm-node as root"))
+	if runner := n.commandRunner(); !runner.IsRoot() {
+		n.sendResult(conn, proto.NewFailure(id, proto.CodeFailed, n.notRoot(runner, "systemctl reboot")))
 		return
 	}
 
@@ -264,13 +287,13 @@ func (n *Node) handleHostReboot(conn net.Conn, id, confirm string) {
 	n.extend(conn, serviceTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), serviceTimeout)
 	defer cancel()
-	if result, err := sys.Run(ctx, sys.RebootArgv()); err != nil || result.ExitCode != 0 {
+	if result, err := n.commandRunner().Run(ctx, sys.RebootArgv()); err != nil || result.ExitCode != 0 {
 		n.logf("REBOOT failed")
 	}
 }
 
 // handleSSHAuthorize installs the console's public key (§8.11).
-func (n *Node) handleSSHAuthorize(conn net.Conn, id, key string) {
+func (n *Node) handleSSHAuthorize(conn net.Conn, id, key, user string) {
 	defer n.cmdMu.Unlock()
 
 	if len(key) > proto.MaxSSHKeyLineLen || !sshkey.Valid(key) {
@@ -278,8 +301,21 @@ func (n *Node) handleSSHAuthorize(conn net.Conn, id, key string) {
 			"key must be one ssh-ed25519 authorized_keys line"))
 		return
 	}
+	if user == "" {
+		user = n.currentSetup().SSHUser
+	}
+	if user == "" {
+		// A node that has never run the setup questions still accepts the
+		// console key, for the account it runs as.
+		user = state.DefaultSetup().SSHUser
+	}
+	if !proto.ValidAccount(user) {
+		n.sendResult(conn, proto.NewFailure(id, proto.CodeBadArgument,
+			"user must be an account name of 1-32 characters from [a-z0-9_.-]"))
+		return
+	}
 
-	path, added, err := sshkey.Authorize(key)
+	path, added, err := sshkey.AuthorizeFor(user, key)
 	if err != nil {
 		n.sendResult(conn, proto.NewFailure(id, proto.CodeFailed, err.Error()))
 		return
@@ -289,10 +325,45 @@ func (n *Node) handleSSHAuthorize(conn net.Conn, id, key string) {
 	if added {
 		state = "added"
 	}
-	n.logf("SSH authorize path=%s state=%s", path, state)
-	n.sendResult(conn, proto.NewResult(id, &proto.SSHAuthorizeResult{Path: path, Added: added}))
+	n.logf("SSH authorize user=%s path=%s state=%s", user, path, state)
+	n.sendResult(conn, proto.NewResult(id, &proto.SSHAuthorizeResult{Path: path, Added: added, User: user}))
 }
 
+// handleNodeSetup changes the answers a later pairing would otherwise ask for
+// (§8.13). A console cannot make the node run as an account it cannot find, so
+// the runner is rebuilt before anything is stored.
+func (n *Node) handleNodeSetup(conn net.Conn, id string, request *proto.NodeSetup) {
+	defer n.cmdMu.Unlock()
+
+	if !proto.ValidAccount(request.RunAs) {
+		n.sendResult(conn, proto.NewFailure(id, proto.CodeBadArgument,
+			"run_as must be an account name of 1-32 characters from [a-z0-9_.-]"))
+		return
+	}
+	if !proto.ValidAccount(request.SSHUser) {
+		n.sendResult(conn, proto.NewFailure(id, proto.CodeBadArgument,
+			"ssh_user must be an account name of 1-32 characters from [a-z0-9_.-]"))
+		return
+	}
+	if !proto.ValidPort(request.SSHPort) {
+		n.sendResult(conn, proto.NewFailure(id, proto.CodeBadArgument, "ssh_port must be 1-65535"))
+		return
+	}
+
+	setup := state.Setup{Configured: true, RunAs: request.RunAs, SSHUser: request.SSHUser, SSHPort: request.SSHPort}
+	warning, err := n.applySetup(setup, io.Discard)
+	if err != nil {
+		n.sendResult(conn, proto.NewFailure(id, proto.CodeFailed, err.Error()))
+		return
+	}
+
+	n.logf("SETUP changed run_as=%s ssh_user=%s ssh_port=%d", setup.RunAs, setup.SSHUser, setup.SSHPort)
+	n.sendResult(conn, proto.NewResult(id, &proto.SetupResult{
+		RunAs: setup.RunAs, SSHUser: setup.SSHUser, SSHPort: setup.SSHPort, Warn: warning,
+	}))
+}
+
+// handleMetrics answers one usage sample.
 func (n *Node) handleMetrics(conn net.Conn, id string) {
 	defer n.cmdMu.Unlock()
 
