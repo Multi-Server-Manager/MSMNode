@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/MSM/MSMNode/internal/proto"
@@ -159,5 +161,97 @@ func Test_dispatch_bad_request_id(t *testing.T) {
 	})
 	if result.OK || result.Code != proto.CodeBadArgument {
 		t.Fatalf("dispatch with bad id = ok:%v code:%s", result.OK, result.Code)
+	}
+}
+
+// fakeManager puts a script named after a package manager first on PATH, so the
+// node's real dispatch path can be exercised without touching this host's
+// packages. It returns the manager name dnf/apt/pacman/apk.
+func fakeManager(t *testing.T, name, output string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" + output + "\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake %s: %v", name, err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// decodePackage reads a package payload the way a console does: through JSON,
+// so the test covers the wire shape and not just the Go struct.
+func decodePackage(t *testing.T, data any) proto.PackageResult {
+	t.Helper()
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var payload proto.PackageResult
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("parse payload: %v", err)
+	}
+	return payload
+}
+
+// Test_pkg_update_says_what_happened proves the sentence the console reads comes
+// from the manager's own report, not from the exit code (PROTOCOL.md §8.5).
+func Test_pkg_update_says_what_happened(t *testing.T) {
+	fakeManager(t, "dnf", "echo 'Transaction Summary:'\necho ' Upgrading:         3 packages'")
+
+	node := newTestNode()
+	node.cmdMu.Lock()
+	result := exchange(t, node, func(conn net.Conn) { node.handlePkgUpdate(conn, "req-1") })
+
+	if !result.OK {
+		t.Fatalf("pkg.update failed: %s %s", result.Code, result.Detail)
+	}
+	payload := decodePackage(t, result.Data)
+	if payload.Summary != "3 packages were updated" {
+		t.Fatalf("summary = %q, want %q", payload.Summary, "3 packages were updated")
+	}
+}
+
+// Test_pkg_install_reports_an_already_installed_package covers the other half:
+// a manager that reports nothing to do is not a silent success.
+func Test_pkg_install_reports_an_already_installed_package(t *testing.T) {
+	fakeManager(t, "dnf", "echo 'Package \"cowsay-3.8.4-5.fc44.noarch\" is already installed.'\necho\necho 'Nothing to do.'")
+
+	node := newTestNode()
+	node.cmdMu.Lock()
+	result := exchange(t, node, func(conn net.Conn) { node.handlePkgInstall(conn, "req-1", "cowsay") })
+
+	if !result.OK {
+		t.Fatalf("pkg.install failed: %s %s", result.Code, result.Detail)
+	}
+	payload := decodePackage(t, result.Data)
+	if payload.Summary != "cowsay was already installed" {
+		t.Fatalf("summary = %q, want %q", payload.Summary, "cowsay was already installed")
+	}
+}
+
+// Test_pkg_update_failure_keeps_the_reason and never invents a summary: a
+// half-written transaction report must not be read as work that happened.
+func Test_pkg_update_failure_keeps_the_reason(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho 'Error: Failed to download metadata for repo' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "dnf"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake dnf: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	node := newTestNode()
+	node.cmdMu.Lock()
+	result := exchange(t, node, func(conn net.Conn) { node.handlePkgUpdate(conn, "req-1") })
+
+	if result.OK {
+		t.Fatal("pkg.update with a failing manager was reported as ok")
+	}
+	if result.Code != proto.CodeFailed {
+		t.Fatalf("code = %s, want %s", result.Code, proto.CodeFailed)
+	}
+	if !strings.Contains(result.Detail, "Failed to download metadata") {
+		t.Fatalf("detail = %q, want the manager's own reason", result.Detail)
+	}
+	if payload := decodePackage(t, result.Data); payload.Summary != "" {
+		t.Fatalf("summary = %q, want none on a failure", payload.Summary)
 	}
 }

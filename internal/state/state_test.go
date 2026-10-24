@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -68,6 +69,58 @@ func Test_save_clients(t *testing.T) {
 	}
 	if len(reloaded.Clients) != 1 || reloaded.Clients[0].ID != "abc" {
 		t.Fatalf("clients = %+v", reloaded.Clients)
+	}
+}
+
+// Test_migrating_a_version_1_config_never_asks_again proves an upgrade from the
+// pre-setup schema is not a first run: the identity, the pins and the answers
+// survive, and the questions stay answered, so restarting the node on the
+// terminal of the upgrade never asks for them again.
+func Test_migrating_a_version_1_config_never_asks_again(t *testing.T) {
+	dir := t.TempDir()
+	cfg, id, err := LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("LoadOrCreate: %v", err)
+	}
+
+	// The shape 1.0.x wrote: schema 1, no setup block, pins present.
+	v1 := struct {
+		Version     int      `json:"version"`
+		NodeID      string   `json:"node_id"`
+		IdentityKey string   `json:"identity_key"`
+		Clients     []Client `json:"clients"`
+	}{
+		Version:     1,
+		NodeID:      cfg.NodeID,
+		IdentityKey: cfg.IdentityKey,
+		Clients:     []Client{{ID: "abc", SPKI: "def"}},
+	}
+	payload, err := json.MarshalIndent(v1, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), payload, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	migrated, migratedID, err := LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("migrating LoadOrCreate: %v", err)
+	}
+	if migrated.Version != ConfigVersion {
+		t.Fatalf("schema = %d, want %d", migrated.Version, ConfigVersion)
+	}
+	if !migrated.Setup.Configured {
+		t.Fatal("a migrated node is unconfigured: the upgrade would ask the questions again")
+	}
+	if migrated.Setup.RunAs == "" || migrated.Setup.SSHUser == "" || migrated.Setup.SSHPort != DefaultSSHPort {
+		t.Fatalf("migrated setup = %+v, want the install defaults", migrated.Setup)
+	}
+	if migrated.NodeID != cfg.NodeID || migratedID.EncodedSPKI() != id.EncodedSPKI() {
+		t.Fatal("the upgrade changed the node identity")
+	}
+	if len(migrated.Clients) != 1 || migrated.Clients[0].ID != "abc" {
+		t.Fatalf("the upgrade lost a pin: %+v", migrated.Clients)
 	}
 }
 

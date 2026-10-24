@@ -112,8 +112,13 @@ func LoadOrCreate(base string) (*Config, *identity.Identity, error) {
 	switch cfg.Version {
 	case 1:
 		// The setup block did not exist; keep the pins and fill in defaults.
+		//
+		// Such a node was already in service with exactly these answers, so the
+		// migration marks them configured: an upgrade is not a first run, and it
+		// must never bring the questions back on the terminal that starts it.
 		cfg.Version = ConfigVersion
 		cfg.Setup = DefaultSetup()
+		cfg.Setup.Configured = true
 		if err := Save(base, &cfg); err != nil {
 			return nil, nil, err
 		}

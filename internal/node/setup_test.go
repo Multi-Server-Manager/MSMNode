@@ -65,6 +65,51 @@ func Test_setup_asks_three_questions(t *testing.T) {
 	}
 }
 
+// Test_setup_is_not_asked_again_on_a_paired_node proves the questions belong to
+// pairing: a node a console already talks to is never asked on a later start,
+// even though it was never answered on its own terminal (a console that predates
+// the setup questions sends none). Restarting or upgrading it must stay silent.
+func Test_setup_is_not_asked_again_on_a_paired_node(t *testing.T) {
+	dir := t.TempDir()
+	node := newSetupNode(t, dir)
+	node.cfg.Clients = append(node.cfg.Clients, state.Client{ID: "abc", SPKI: "def"})
+	if err := state.Save(dir, node.cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := node.configureSetup(strings.NewReader("this must never be read\n"), &out, SetupFlags{}, true); err != nil {
+		t.Fatalf("configureSetup: %v", err)
+	}
+	if strings.Contains(out.String(), "commands run as [") {
+		t.Fatalf("a paired node asked the first-run questions: %q", out.String())
+	}
+	if !node.currentSetup().Configured {
+		t.Fatal("the answers were not recorded as configured")
+	}
+	if !strings.Contains(out.String(), "reason=already-configured") {
+		t.Fatalf("the log does not say why nothing was asked: %q", out.String())
+	}
+
+	// The next start (the re-exec onto a new binary, or a plain restart) says
+	// nothing at all.
+	var second bytes.Buffer
+	if err := node.configureSetup(strings.NewReader(""), &second, SetupFlags{}, true); err != nil {
+		t.Fatalf("second configureSetup: %v", err)
+	}
+	if second.Len() != 0 {
+		t.Fatalf("a restart of a configured node wrote %q", second.String())
+	}
+
+	stored, _, err := state.LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !stored.Setup.Configured || len(stored.Clients) != 1 {
+		t.Fatalf("stored config = %+v", stored)
+	}
+}
+
 // Test_setup_skips_without_a_terminal proves a service start never blocks.
 func Test_setup_skips_without_a_terminal(t *testing.T) {
 	dir := t.TempDir()

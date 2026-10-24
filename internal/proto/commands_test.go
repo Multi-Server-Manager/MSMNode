@@ -142,3 +142,24 @@ func Test_request_id_charset(t *testing.T) {
 		}
 	}
 }
+
+// Test_package_result_summary proves the one-sentence outcome travels in the
+// payload, and that a node with nothing to say does not put an empty member on
+// the wire (PROTOCOL.md §8.5). The Rust console parses the same field.
+func Test_package_result_summary(t *testing.T) {
+	encoded, err := json.Marshal(PackageResult{Manager: "dnf", Summary: "there were no updates"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"summary":"there were no updates"`) {
+		t.Fatalf("payload = %s, want a summary member", encoded)
+	}
+
+	encoded, err = json.Marshal(PackageResult{Manager: "dnf"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(encoded), `"summary"`) {
+		t.Fatalf("payload = %s, want no summary member", encoded)
+	}
+}

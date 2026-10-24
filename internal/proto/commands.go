@@ -156,6 +156,11 @@ type PackageResult struct {
 	Commands [][]string `json:"commands"`
 	ExitCode int        `json:"exit_code"`
 	Output   string     `json:"output"`
+	// Summary is the outcome in one sentence — "there were no updates", "3
+	// packages were updated", "figlet was installed" — so a console never has
+	// to read a package manager's log to find out what happened. Display text
+	// only; exit_code is what says whether the run succeeded.
+	Summary string `json:"summary,omitempty"`
 }
 
 // ServiceResult is the payload of svc.restart (§8.7).

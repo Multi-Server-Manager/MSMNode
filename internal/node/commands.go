@@ -186,11 +186,23 @@ func (n *Node) runPackage(conn net.Conn, id, name string) {
 		}
 	}
 
+	// What the manager reported it did, in words. Computed from the same output
+	// the console receives, and logged here so `logs.tail` reads as well as the
+	// panel: "there were no updates" beats "dnf -y upgrade" followed by silence.
+	// A failed run gets no sentence — the refusal's detail already says why, and
+	// reading a half-written transaction report would claim work that never
+	// happened.
+	summary := ""
+	if failure == "" {
+		summary = manager.Summarize(name, output.String())
+	}
+
 	payload := &proto.PackageResult{
 		Manager:  manager.Name,
 		Commands: executed,
 		ExitCode: exitCode,
 		Output:   sys.TrimOutput(output.String()),
+		Summary:  summary,
 	}
 	if failure != "" {
 		n.logf("COMMAND failed=%s", failure)
@@ -199,6 +211,7 @@ func (n *Node) runPackage(conn net.Conn, id, name string) {
 		n.sendResult(conn, result)
 		return
 	}
+	n.logf("COMMAND ok=%s", summary)
 	n.sendResult(conn, proto.NewResult(id, payload))
 }
 

@@ -23,9 +23,16 @@ type SetupFlags struct {
 	Skip    bool
 }
 
-// needsSetup reports whether the questions are still unanswered.
+// needsSetup reports whether the questions still need an answer.
+//
+// Only a node that has never answered them and has never been paired. A node
+// already in service has answers by definition — its console sent them when it
+// paired, or the install defaults did — so a restart, an upgrade and the re-exec
+// onto a new binary never bring the questions back.
 func (n *Node) needsSetup() bool {
-	return !n.cfg.Setup.Configured
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return !n.cfg.Setup.Configured && len(n.cfg.Clients) == 0
 }
 
 // configureSetup asks the first-run questions on the node's own terminal.
@@ -65,20 +72,21 @@ func (n *Node) configureSetup(in io.Reader, out io.Writer, flags SetupFlags, ask
 		return err
 	}
 
-	if flags.Skip || !ask || !n.needsSetup() {
-		if !setup.Configured {
-			// Nothing was asked, so the defaults stand until someone asks.
-			// This is the path a service and a detached upgrade take; it must
-			// never read stdin, because there is nobody to answer.
-			if !flags.Skip {
-				fmt.Fprintf(out, "SETUP unanswered=1 reason=no-terminal defaults=run_as:%s,ssh_user:%s,ssh_port:%d\n",
-					setup.RunAs, setup.SSHUser, setup.SSHPort)
-			}
-			setup.Configured = true
-			_, err := n.applySetup(setup, out)
-			return err
+	if !n.needsSetup() {
+		// Already answered, or already serving a console: an upgrade must not
+		// ask an operator to answer for a node that is in service.
+		return n.keepAnswers(setup, out, "already-configured")
+	}
+
+	if flags.Skip || !ask {
+		// Nothing was asked, so the defaults stand until someone asks. This is
+		// the path a service, a detached child and an upgrade's --check take; it
+		// must never read stdin, because there is nobody to answer.
+		reason := "no-terminal"
+		if flags.Skip {
+			reason = "no-setup"
 		}
-		return nil
+		return n.keepAnswers(setup, out, reason)
 	}
 
 	reader := bufio.NewReader(in)
@@ -104,6 +112,22 @@ func (n *Node) configureSetup(in io.Reader, out io.Writer, flags SetupFlags, ask
 	setup.Configured = true
 
 	_, err = n.applySetup(setup, out)
+	return err
+}
+
+// keepAnswers records the answers that will stand instead of asking for them.
+//
+// The reason says why nothing was asked (`no-terminal`, `no-setup`, or
+// `already-configured`), so the log explains a silent first start on a service,
+// and an upgrade that never re-asks.
+func (n *Node) keepAnswers(setup state.Setup, out io.Writer, reason string) error {
+	if setup.Configured {
+		return nil
+	}
+	fmt.Fprintf(out, "SETUP unanswered=1 reason=%s defaults=run_as:%s,ssh_user:%s,ssh_port:%d\n",
+		reason, setup.RunAs, setup.SSHUser, setup.SSHPort)
+	setup.Configured = true
+	_, err := n.applySetup(setup, out)
 	return err
 }
 
